@@ -1,0 +1,21 @@
+# systemd timer: triggers spacewx-collector.service every 5 minutes.
+# Install to: /etc/systemd/system/spacewx-collector.timer
+# Then: sudo systemctl enable --now spacewx-collector.timer
+
+[Unit]
+Description=Run the space weather collector every 5 minutes
+
+[Timer]
+# At minutes 0, 5, 10, ... of every hour.
+OnCalendar=*:0/5
+# If the machine was off (reboot, outage) at a scheduled time, run once as soon
+# as it is back instead of waiting for the next slot. Combined with NOAA's 24 h
+# feed history, an outage of up to a day leaves no gap in the data.
+Persistent=true
+# Spread the requests a few seconds so we do not hit NOAA exactly on the minute.
+RandomizedDelaySec=20
+Unit=spacewx-collector.service
+
+[Install]
+# Start the timer automatically at boot.
+WantedBy=timers.target

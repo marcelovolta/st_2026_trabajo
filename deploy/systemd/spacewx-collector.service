@@ -1,0 +1,27 @@
+# systemd service: runs ONE collection cycle and exits (Type=oneshot).
+# The timer (spacewx-collector.timer) starts it every 5 minutes.
+# Install to: /etc/systemd/system/spacewx-collector.service
+
+[Unit]
+Description=Space weather collector (one cycle)
+# Wait for the network at boot; otherwise the first run after a reboot would fail.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Dedicated unprivileged user (created in COLLECTOR.md, step 4).
+User=spacewx
+Group=spacewx
+# collect.R must run from the project root (renv and R/ are found relative to it).
+WorkingDirectory=/opt/spacewx-collector
+# Settings (database path, healthcheck URL...). The leading "-" means the file
+# is optional: no error if it does not exist. Format: KEY=value, one per line.
+EnvironmentFile=-/etc/spacewx-collector.env
+# Check the real path on your VPS with `which Rscript`.
+ExecStart=/usr/local/bin/Rscript collect.R
+# A normal run takes ~2 s. Kill it if it hangs so the next tick can start clean.
+TimeoutStartSec=120
+# Light hardening that does not interfere with R/renv.
+NoNewPrivileges=true
+PrivateTmp=true

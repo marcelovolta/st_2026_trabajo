@@ -2,3 +2,12 @@
 .Rhistory
 .RData
 .Ruserdata
+
+# Collector: local data, logs and secrets never go into git
+data/
+logs/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env
+.DS_Store

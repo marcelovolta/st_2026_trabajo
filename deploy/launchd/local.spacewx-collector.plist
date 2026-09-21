@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS equivalent of the systemd timer, for testing on your Mac mini.
+  Install:
+    mkdir -p ~/repos/st_2026_trabajo/logs
+    cp deploy/launchd/local.spacewx-collector.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.spacewx-collector.plist
+  Stop / remove:
+    launchctl bootout gui/$(id -u)/local.spacewx-collector
+  A LaunchAgent only runs while you are logged in and the Mac is awake.
+  launchd needs ABSOLUTE paths; edit them below if your project lives elsewhere.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.spacewx-collector</string>
+
+  <!-- Same command as on the VPS: Rscript collect.R -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/Rscript</string>
+    <string>collect.R</string>
+  </array>
+
+  <!-- Must be the project root (renv and R/ are found relative to it). -->
+  <key>WorkingDirectory</key>
+  <string>/Users/sergiovolta/repos/st_2026_trabajo</string>
+
+  <!-- Run every 300 seconds, and once immediately when loaded. -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- launchd does not create the logs/ folder for you (see Install above). -->
+  <key>StandardOutPath</key>
+  <string>/Users/sergiovolta/repos/st_2026_trabajo/logs/collector.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/sergiovolta/repos/st_2026_trabajo/logs/collector.log</string>
+</dict>
+</plist>
