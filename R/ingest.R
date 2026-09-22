@@ -1,16 +1,36 @@
 # ---- Download + store one feed -----------------------------------------------
 
 # Download a JSON feed and parse it into a data frame.
-# httr2 retries automatically on timeouts, network errors and HTTP 429/5xx
-# (with growing waits between attempts), so a brief NOAA hiccup is not a failure.
+#
+# The download AND the parsing are retried together (up to cfg$max_tries times,
+# waiting 2 s, then 4 s, ...). That matters because NOAA sometimes serves a
+# truncated file with HTTP status 200 while it is rewriting it: the download
+# "succeeds" but parsing fails ("premature EOF"). Retrying a moment later
+# gets the complete file, so a transient glitch is not counted as a failure.
+# The same loop covers timeouts, network errors and HTTP error codes.
 fetch_feed <- function(url, cfg) {
-  resp <- httr2::request(url) |>
-    httr2::req_user_agent(cfg$user_agent) |>
-    httr2::req_timeout(cfg$timeout_s) |>
-    httr2::req_retry(max_tries = cfg$max_tries, retry_on_failure = TRUE) |>
-    httr2::req_perform()
-  # A JSON array of objects becomes a data frame; JSON `null` becomes NA.
-  jsonlite::fromJSON(httr2::resp_body_string(resp))
+  last_error <- NULL
+  for (attempt in seq_len(cfg$max_tries)) {
+    result <- tryCatch({
+      resp <- httr2::request(url) |>
+        httr2::req_user_agent(cfg$user_agent) |>
+        httr2::req_timeout(cfg$timeout_s) |>
+        httr2::req_perform()
+      # A JSON array of objects becomes a data frame; JSON `null` becomes NA.
+      jsonlite::fromJSON(httr2::resp_body_string(resp))
+    }, error = function(e) e)
+
+    if (!inherits(result, "error")) return(result)
+
+    last_error <- result
+    if (attempt < cfg$max_tries) {
+      log_msg("WARN", sprintf("attempt %d/%d failed (%s); retrying",
+                              attempt, cfg$max_tries,
+                              trimws(strsplit(conditionMessage(result), "\n")[[1]][1])))
+      Sys.sleep(2^attempt)
+    }
+  }
+  stop(last_error)  # every attempt failed: let the caller record the error
 }
 
 # Convert a column to the type its database column expects.

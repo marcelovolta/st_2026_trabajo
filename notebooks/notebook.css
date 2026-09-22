@@ -1,0 +1,11 @@
+/* Light chart surface and ink from the reference palette, so the page and the
+   figures (drawn on #fcfcfb) look like one surface. */
+body {
+  background: #fcfcfb;
+  color: #0b0b0b;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1, h2, h3 { font-weight: 600; }
+.quarto-title-meta, .subtitle, .date { color: #52514e; }
+table { font-size: 0.92rem; }
+figure img { max-width: 100%; }

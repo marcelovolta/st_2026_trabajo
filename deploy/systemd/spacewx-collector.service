@@ -20,8 +20,9 @@ WorkingDirectory=/opt/spacewx-collector
 EnvironmentFile=-/etc/spacewx-collector.env
 # Check the real path on your VPS with `which Rscript`.
 ExecStart=/usr/local/bin/Rscript collect.R
-# A normal run takes ~2 s. Kill it if it hangs so the next tick can start clean.
-TimeoutStartSec=120
+# A normal run takes ~2 s. Worst case (NOAA unreachable) is 3 feeds x 3 attempts
+# x 30 s timeout plus waits, so allow 5 minutes before killing a hung run.
+TimeoutStartSec=300
 # Light hardening that does not interfere with R/renv.
 NoNewPrivileges=true
 PrivateTmp=true

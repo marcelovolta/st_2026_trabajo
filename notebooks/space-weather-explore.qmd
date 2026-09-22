@@ -1,0 +1,502 @@
+---
+title: "Space weather at L1: first look at the data"
+subtitle: "Progress report: data collection and exploratory analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+    fig-format: png
+    fig-dpi: 144
+    css: notebook.css
+execute:
+  warning: false
+  message: false
+---
+
+## Where the project stands
+
+**Goal:** forecast solar wind conditions, and the geomagnetic activity they cause, in near real time. Spacecraft at the Sun-Earth Lagrange point L1 (1.5 million km sunward of Earth) measure the solar wind 30-60 minutes before it reaches us.
+
+**Done so far**
+
+- A collector downloads NOAA's live solar wind, magnetic field and Kp feeds every 5 minutes into a SQLite database. It runs unattended, survives restarts and never stores duplicates.
+- This notebook is a first quality check of what has been collected: the data in the time domain and in the frequency domain.
+
+**Next**
+
+- Move the collector to an always-on server, so the history has no gaps.
+- Build forecasting models and score them against a naive baseline (see the last section for why the baseline matters).
+
+Background on the science, the spacecraft and every variable: `docs/space-weather-data.md`.
+
+```{r}
+#| label: setup
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(knitr)
+
+# ---- Settings -----------------------------------------------------------------
+# Database to read. Default: the collector's database in the project root. To
+# explore a copy from the VPS, set the SPACEWX_DB_PATH environment variable to
+# its absolute path before rendering.
+db_path <- Sys.getenv("SPACEWX_DB_PATH", unset = "../data/spacewx.sqlite")
+
+# Time window, in UTC. NULL = from 00:00 UTC of the newest observation's day
+# until the newest observation ("the present day"). Example override:
+#   window_start <- "2026-09-21 06:00:00";  window_end <- "2026-09-21 18:00:00"
+window_start <- NULL
+window_end   <- NULL
+
+# ---- Look and feel (reference palette; light surface) ------------------------
+ink <- "#0b0b0b"; ink2 <- "#52514e"; muted <- "#898781"
+grid_col <- "#e1e0d9"; axis_col <- "#c3c2b7"; surface <- "#fcfcfb"
+
+# One color per spacecraft, fixed by entity (slots 1-3 of the categorical
+# palette), so a source keeps its color in every chart.
+source_colors <- c(SOLAR1 = "#2a78d6", ACE = "#eb6834", IMAP = "#1baf7a",
+                   DSCOVR = "#eda100")
+one_color <- "#2a78d6"   # single-series charts
+# Sequential blue ramp (light = little power, dark = a lot) for the spectrogram.
+blues <- c("#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b")
+
+theme_swx <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.background   = element_rect(fill = surface, colour = NA),
+      panel.background  = element_rect(fill = surface, colour = NA),
+      panel.grid.major  = element_line(colour = grid_col, linewidth = 0.3),
+      panel.grid.minor  = element_blank(),
+      axis.line.x       = element_line(colour = axis_col, linewidth = 0.4),
+      axis.text         = element_text(colour = muted),
+      axis.title        = element_text(colour = ink2),
+      plot.title        = element_text(colour = ink, face = "bold", size = 13),
+      plot.subtitle     = element_text(colour = ink2),
+      plot.title.position = "plot",
+      strip.text        = element_text(colour = ink, face = "bold", hjust = 0),
+      legend.position   = "top",
+      legend.text       = element_text(colour = ink2),
+      legend.title      = element_blank()
+    )
+}
+
+# ---- Load the data ------------------------------------------------------------
+con <- DBI::dbConnect(RSQLite::SQLite(), db_path, flags = RSQLite::SQLITE_RO)
+parse_time <- function(x) as.POSIXct(x, format = "%Y-%m-%dT%H:%M:%S", tz = "UTC")
+iso <- function(t) format(t, "%Y-%m-%dT%H:%M:%S", tz = "UTC")
+
+newest  <- DBI::dbGetQuery(con, "SELECT MAX(time_tag) AS t FROM wind")$t
+win_end <- if (is.null(window_end)) parse_time(newest) else as.POSIXct(window_end, tz = "UTC")
+win_start <- if (is.null(window_start)) floor_date(win_end, "day") else as.POSIXct(window_start, tz = "UTC")
+# Early in the UTC day there is too little data for spectra: use the last 24 h.
+if (difftime(win_end, win_start, units = "hours") < 6) win_start <- win_end - hours(24)
+
+query <- function(sql, ...) DBI::dbGetQuery(con, sql, params = list(...))
+wind <- query("SELECT * FROM wind WHERE time_tag >= ? AND time_tag <= ?", iso(win_start), iso(win_end))
+mag  <- query("SELECT * FROM mag  WHERE time_tag >= ? AND time_tag <= ?", iso(win_start), iso(win_end))
+kp   <- query("SELECT * FROM kp   WHERE time_tag >= ?", iso(win_end - days(7)))
+runs <- query("SELECT feed, status, COUNT(*) AS n FROM ingest_log WHERE run_at >= ? GROUP BY feed, status", iso(win_start))
+DBI::dbDisconnect(con)
+
+# One value per source per minute (sources stamp odd seconds, e.g. 12:16:05).
+per_minute <- function(df, cols) {
+  df |>
+    mutate(minute = floor_date(parse_time(time_tag), "minute")) |>
+    group_by(source, active, minute) |>
+    summarise(across(all_of(cols), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+    mutate(across(all_of(cols), \(x) ifelse(is.nan(x), NA, x)))
+}
+wind_min <- per_minute(wind, c("proton_speed", "proton_density", "proton_temperature"))
+mag_min  <- per_minute(mag,  c("bt", "bx_gsm", "by_gsm", "bz_gsm"))
+kp <- kp |> mutate(time = parse_time(time_tag))
+
+# The source NOAA flags as active (primary) with the most data in the window.
+primary <- wind_min |> filter(active == 1) |> count(source, sort = TRUE) |>
+  slice(1) |> pull(source)
+if (length(primary) == 0) primary <- wind_min |> count(source, sort = TRUE) |> slice(1) |> pull(source)
+
+# Complete 1-minute grid: missing minutes become NA, so charts show a break
+# instead of a straight line drawn across an outage.
+minute_grid <- tibble(minute = seq(floor_date(win_start, "minute"),
+                                   floor_date(win_end, "minute"), by = "1 min"))
+prim_w <- minute_grid |> left_join(filter(wind_min, source == primary), by = "minute")
+prim_m <- minute_grid |> left_join(filter(mag_min,  source == primary), by = "minute")
+n_minutes <- nrow(minute_grid)
+```
+
+## 1. What data are we looking at?
+
+```{r}
+#| label: overview
+fmt <- function(t) format(t, "%Y-%m-%d %H:%M", tz = "UTC")
+```
+
+- **Window (UTC):** `r fmt(win_start)` to `r fmt(win_end)` (`r round(n_minutes / 60, 1)` hours, `r n_minutes` minutes).
+- **Primary source used in the charts below:** `r primary` (the one NOAA flags as active).
+- **Database:** `r basename(db_path)`.
+
+```{r}
+#| label: coverage
+# Table view of what each spacecraft delivered in the window.
+wind_min |>
+  group_by(Source = source) |>
+  summarise(`Minutes with data` = sum(!is.na(proton_speed)),
+            `Coverage of window` = sprintf("%.1f%%", 100 * sum(!is.na(proton_speed)) / n_minutes),
+            `Flagged active` = ifelse(any(active == 1), "yes", "no"),
+            First = fmt(min(minute)), Last = fmt(max(minute)), .groups = "drop") |>
+  arrange(desc(`Minutes with data`)) |>
+  kable(caption = "Solar wind plasma coverage by spacecraft")
+
+# Collector health over the same period.
+runs |>
+  pivot_wider(names_from = status, values_from = n, values_fill = 0) |>
+  rename(Feed = feed) |>
+  kable(caption = "Collector runs since the start of the window (ok / error)")
+```
+
+Three spacecraft measure the same solar wind in parallel. NOAA's operational (primary) source is SOLAR-1; ACE is the backup and IMAP is still ramping up its real-time stream, so its coverage is lower.
+
+## 2. Time domain
+
+### The primary source, all variables
+
+```{r}
+#| label: time-series
+#| fig-width: 10
+#| fig-height: 10
+#| fig-alt: "Five stacked line charts over the window: solar wind speed, density, temperature, total magnetic field and Bz, from the primary spacecraft."
+lv <- c("Speed (km/s)", "Density (particles/cm³)", "Temperature (K)",
+        "Total field Bt (nT)", "Bz, north-south field (nT)")
+long <- bind_rows(
+  prim_w |> transmute(minute, variable = lv[1], value = proton_speed),
+  prim_w |> transmute(minute, variable = lv[2], value = proton_density),
+  prim_w |> transmute(minute, variable = lv[3], value = proton_temperature),
+  prim_m |> transmute(minute, variable = lv[4], value = bt),
+  prim_m |> transmute(minute, variable = lv[5], value = bz_gsm)
+) |> mutate(variable = factor(variable, levels = lv))
+
+zero_line <- tibble(variable = factor(lv[5], levels = lv), y = 0)
+
+ggplot(long, aes(minute, value)) +
+  geom_hline(data = zero_line, aes(yintercept = y), colour = axis_col, linewidth = 0.4) +
+  geom_line(colour = one_color, linewidth = 0.45, na.rm = TRUE) +
+  facet_wrap(~variable, ncol = 1, scales = "free_y") +
+  scale_x_datetime(date_labels = "%H:%M", expand = expansion(mult = 0.01)) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(title = sprintf("Solar wind and magnetic field at L1 (%s)", primary),
+       subtitle = "One observation per minute. Bz below zero (south) is the orientation that drives storms.",
+       x = "Time (UTC)", y = NULL) +
+  theme_swx()
+```
+
+```{r}
+#| label: summary-stats
+long |>
+  group_by(Variable = variable) |>
+  summarise(Minutes = sum(!is.na(value)), Min = min(value, na.rm = TRUE),
+            Mean = mean(value, na.rm = TRUE), Median = median(value, na.rm = TRUE),
+            Max = max(value, na.rm = TRUE), SD = sd(value, na.rm = TRUE), .groups = "drop") |>
+  # 4 significant digits, no scientific notation (works for both 1.7 and 53,210).
+  mutate(across(Min:SD, \(x) formatC(x, format = "fg", digits = 4, big.mark = ","))) |>
+  kable(caption = "Summary statistics (table view of the chart above)")
+```
+
+For calm conditions, expect speed of roughly 300-450 km/s, density of a few particles/cm³ and a total field of about 5 nT. Sudden simultaneous jumps in speed, density and field strength mark shocks from coronal mass ejections.
+
+### Do the spacecraft agree?
+
+The three spacecraft sit at slightly different places and use different instruments, so they should track each other closely. Large or growing differences would point to a calibration or data-quality problem.
+
+```{r}
+#| label: compare-sources
+#| fig-width: 10
+#| fig-height: 6.5
+#| fig-alt: "Top: solar wind speed from each spacecraft overlaid, lines nearly coincide. Bottom: difference in speed between each backup spacecraft and the primary one over time."
+speed_by_source <- wind_min |> select(source, minute, value = proton_speed)
+others <- setdiff(unique(wind_min$source), primary)
+
+diffs <- speed_by_source |>
+  filter(source %in% others) |>
+  inner_join(filter(speed_by_source, source == primary) |> select(minute, ref = value), by = "minute") |>
+  mutate(diff = value - ref)
+
+panel_levels <- c("Speed by spacecraft (km/s)",
+                  sprintf("Difference from %s: backup minus primary (km/s)", primary))
+compare_long <- bind_rows(
+  speed_by_source |> mutate(panel = panel_levels[1]),
+  diffs |> transmute(source, minute, value = diff, panel = panel_levels[2])
+) |> mutate(panel = factor(panel, levels = panel_levels))
+zero_diff <- tibble(panel = factor(panel_levels[2], levels = panel_levels), y = 0)
+
+ggplot(compare_long, aes(minute, value, colour = source)) +
+  geom_hline(data = zero_diff, aes(yintercept = y), colour = axis_col, linewidth = 0.4,
+             inherit.aes = FALSE) +
+  geom_line(linewidth = 0.4, na.rm = TRUE) +
+  facet_wrap(~panel, ncol = 1, scales = "free_y") +
+  scale_colour_manual(values = source_colors,
+                      breaks = names(source_colors)[names(source_colors) %in% speed_by_source$source]) +
+  scale_x_datetime(date_labels = "%H:%M") +
+  labs(title = "Solar wind speed: agreement between spacecraft", x = "Time (UTC)", y = NULL) +
+  theme_swx()
+```
+
+```{r}
+#| label: compare-table
+tab <- lapply(others, function(s) {
+  d <- speed_by_source |> filter(source %in% c(primary, s)) |>
+    pivot_wider(names_from = source, values_from = value) |> drop_na()
+  tibble(`Backup source` = s, `Minutes in common` = nrow(d),
+         `Mean difference (km/s)` = round(mean(d[[s]] - d[[primary]]), 2),
+         `SD of difference (km/s)` = round(sd(d[[s]] - d[[primary]]), 2),
+         Correlation = round(cor(d[[s]], d[[primary]]), 4))
+}) |> bind_rows()
+kable(tab, caption = sprintf("Speed of each backup source compared with %s", primary))
+```
+
+### Geomagnetic activity (Kp) over the last 7 days
+
+```{r}
+#| label: kp
+#| fig-width: 10
+#| fig-height: 3.6
+#| fig-alt: "Bar chart of the estimated planetary Kp index in 3-hour periods over the last 7 days, with a reference line at Kp 5, the storm threshold."
+ggplot(kp, aes(time + 90 * 60, kp)) +
+  geom_col(width = 3 * 3600 * 0.85, fill = one_color) +
+  geom_hline(yintercept = 5, colour = ink2, linewidth = 0.4) +
+  annotate("text", x = min(kp$time) + 90 * 60, y = 5, hjust = 0, vjust = -0.6,
+           label = "Kp 5 = G1 (minor storm)", colour = ink2, size = 3.3) +
+  scale_y_continuous(limits = c(0, 9), breaks = 0:9) +
+  scale_x_datetime(date_labels = "%b %d", date_breaks = "1 day") +
+  labs(title = "Estimated planetary Kp index", subtitle = "One value per 3-hour period, 0 (quiet) to 9 (extreme)",
+       x = "Date (UTC)", y = "Kp") + theme_swx()
+```
+
+### Data quality: missing minutes
+
+```{r}
+#| label: gaps
+miss <- is.na(prim_w$proton_speed)
+r <- rle(miss); ends <- cumsum(r$lengths); starts <- ends - r$lengths + 1
+gaps <- tibble(start = prim_w$minute[starts], minutes = r$lengths, missing = r$values) |>
+  filter(missing, minutes >= 3) |> arrange(desc(minutes))
+```
+
+The primary source has `r sum(miss)` missing minutes out of `r n_minutes` (`r sprintf("%.1f%%", 100 * mean(miss))`).
+`r if (nrow(gaps) == 0) "There are no gaps of 3 minutes or more." else paste0("There are ", nrow(gaps), " gaps of 3 minutes or more; the longest is ", max(gaps$minutes), " minutes.")`
+
+```{r}
+#| label: gaps-table
+if (nrow(gaps) > 0) {
+  gaps |> transmute(`Gap starts (UTC)` = fmt(start), `Minutes missing` = minutes) |>
+    head(10) |> kable(caption = "Longest gaps in the primary plasma series")
+}
+```
+
+## 3. Frequency domain
+
+The time series above mixes slow drifts and fast fluctuations. Frequency analysis separates them: **how much variation happens at each timescale?** It also reveals periodic behavior and tells us how much of the signal is predictable structure and how much is fast fluctuation.
+
+Spectral methods need evenly spaced data. We take the 1-minute grid, fill gaps of up to 5 minutes by linear interpolation, and analyze the longest continuous stretch.
+
+```{r}
+#| label: prep
+# Longest continuous stretch of a 1-minute series, after filling short gaps.
+prep_series <- function(x, max_fill = 5) {
+  idx <- seq_along(x); ok <- !is.na(x)
+  if (sum(ok) < 10) return(list(x = numeric(0), start_index = NA, n_filled = 0))
+  filled <- approx(idx[ok], x[ok], xout = idx, rule = 1)$y     # NA outside observed range
+  r <- rle(is.na(x)); e <- cumsum(r$lengths); s <- e - r$lengths + 1
+  for (g in which(r$values & r$lengths > max_fill)) filled[s[g]:e[g]] <- NA  # keep long gaps
+  r2 <- rle(!is.na(filled)); e2 <- cumsum(r2$lengths); s2 <- e2 - r2$lengths + 1
+  cand <- which(r2$values); best <- cand[which.max(r2$lengths[cand])]
+  rng <- s2[best]:e2[best]
+  list(x = filled[rng], start_index = s2[best], n_filled = sum(is.na(x[rng])))
+}
+
+series <- list(
+  "Speed"   = prep_series(prim_w$proton_speed),
+  "Density" = prep_series(prim_w$proton_density),
+  "Bz"      = prep_series(prim_m$bz_gsm)
+)
+prep_tab <- tibble(
+  Variable = names(series),
+  `Minutes analyzed` = sapply(series, \(s) length(s$x)),
+  `Hours` = round(`Minutes analyzed` / 60, 1),
+  `Filled by interpolation` = sapply(series, \(s) s$n_filled)
+)
+kable(prep_tab, caption = "Continuous stretch used for each spectrum")
+```
+
+### Power spectrum
+
+The **power spectrum** shows the variance of the signal at each frequency. Both axes are logarithmic. Slow variations (long periods) are on the left and fast ones on the right; the fastest resolvable period with 1-minute data is 2 minutes.
+
+Solar wind turbulence is commonly described by a power-law decline in power with frequency, with a slope near -5/3 (the Kolmogorov value) over timescales of minutes to about an hour. We fit the slope between periods of about 5 and 55 minutes and draw a -5/3 line for reference, **to compare, not to claim a match**.
+
+```{r}
+#| label: psd
+#| fig-width: 10
+#| fig-height: 7
+#| fig-alt: "Three log-log power spectra, for speed, density and Bz, with power falling as frequency rises, and a reference line of slope minus five thirds."
+psd <- function(seg) {
+  s <- spec.pgram(ts(seg, frequency = 1), spans = c(5, 5), taper = 0.1, detrend = TRUE, plot = FALSE)
+  tibble(freq_mhz = s$freq / 60 * 1000, power = s$spec)   # cycles/minute -> millihertz
+}
+spec_df <- lapply(names(series), \(v) if (length(series[[v]]$x) > 60) psd(series[[v]]$x) |> mutate(variable = v)) |> bind_rows()
+
+band <- c(0.3, 3)   # millihertz: periods of ~55 min to ~5.5 min
+fits <- spec_df |> group_by(variable) |>
+  group_modify(\(d, k) {
+    b <- filter(d, freq_mhz >= band[1], freq_mhz <= band[2])
+    m <- lm(log10(power) ~ log10(freq_mhz), data = b)
+    tibble(slope = unname(coef(m)[2]), level_1mhz = 10^unname(coef(m)[1]))
+  }) |> ungroup()
+
+ref_line <- fits |> group_by(variable) |>
+  reframe(freq_mhz = range(spec_df$freq_mhz), power = level_1mhz * freq_mhz^(-5 / 3))
+labels_df <- fits |> mutate(label = sprintf("fitted slope %.2f  (reference: -1.67)", slope))
+
+period_min <- c(360, 120, 60, 30, 10, 5, 2)
+brk <- (1 / period_min) / 60 * 1000
+spec_df <- mutate(spec_df, variable = factor(variable, levels = names(series)))
+ref_line <- mutate(ref_line, variable = factor(variable, levels = names(series)))
+labels_df <- mutate(labels_df, variable = factor(variable, levels = names(series)))
+
+ggplot(spec_df, aes(freq_mhz, power)) +
+  geom_line(colour = one_color, linewidth = 0.5) +
+  geom_line(data = ref_line, colour = ink2, linewidth = 0.5) +
+  geom_text(data = labels_df, aes(x = max(spec_df$freq_mhz), y = Inf, label = label),
+            hjust = 1, vjust = 1.6, colour = ink2, size = 3.3) +
+  facet_wrap(~variable, ncol = 1, scales = "free_y") +
+  scale_x_log10(breaks = brk, labels = c("6 h", "2 h", "1 h", "30 min", "10 min", "5 min", "2 min")) +
+  scale_y_log10(labels = scales::label_log()) +
+  labs(title = "Power spectra: how much variation at each timescale",
+       subtitle = "Blue: measured (smoothed periodogram). Gray: -5/3 reference line through the fitted level.",
+       x = "Period of the fluctuation (log scale): slow on the left, fast on the right",
+       y = "Power (relative units, log scale)") +
+  theme_swx()
+```
+
+### How the frequency content changes over time
+
+A single spectrum averages the whole window. The **spectrogram** slides a 128-minute window along the series and computes a spectrum in each position, so we can see *when* the fluctuations are strong. Darker means more power (log scale). Speed and Bz have different units, so each panel has its own color scale: compare *within* a panel, not between them. Power is always highest at low frequencies (the bottom of each panel), as the spectra above show, so look for horizontal bands that get darker or lighter over time.
+
+```{r}
+#| label: spectrogram
+#| fig-width: 10
+#| fig-height: 7
+#| fig-alt: "Two spectrograms, for speed and for Bz, with time on the horizontal axis, frequency in cycles per hour on the vertical axis and darker blue meaning more power."
+stft <- function(x, t0, win = 128, step = 16) {
+  if (length(x) < win + step) return(NULL)
+  w <- 0.5 - 0.5 * cos(2 * pi * (0:(win - 1)) / (win - 1))      # Hann window
+  freqs_cph <- (1:(win / 2)) / win * 60                            # cycles per hour
+  starts <- seq(1, length(x) - win + 1, by = step)
+  lapply(starts, \(s) {
+    seg <- x[s:(s + win - 1)]
+    seg <- resid(lm(seg ~ seq_along(seg)))                         # remove linear trend
+    p <- Mod(fft(seg * w))[2:(win / 2 + 1)]^2 / sum(w^2)
+    tibble(time = t0 + (s + win / 2 - 1) * 60, freq_cph = freqs_cph, power = p)
+  }) |> bind_rows()
+}
+
+spgm <- lapply(c("Speed", "Bz"), \(v) {
+  s <- series[[v]]
+  t0 <- prim_w$minute[1] + (s$start_index - 1) * 60
+  d <- stft(s$x, t0)
+  if (!is.null(d)) mutate(d, variable = v)
+}) |> bind_rows()
+
+if (nrow(spgm) > 0) {
+  # Speed (km/s) and Bz (nT) have different units, so their powers cannot share
+  # one color scale. Each panel is scaled on its own: log power, clipped to its
+  # 2nd-98th percentile, then mapped to 0 (low) ... 1 (high).
+  spgm <- spgm |>
+    group_by(variable) |>
+    mutate(logp = log10(power + 1e-12),
+           lo = quantile(logp, 0.02), hi = quantile(logp, 0.98),
+           rel = pmin(pmax((logp - lo) / (hi - lo), 0), 1)) |>
+    ungroup() |>
+    mutate(variable = factor(variable, levels = c("Speed", "Bz")))
+  ggplot(spgm, aes(time, freq_cph, fill = rel)) +
+    geom_tile(width = 16 * 60, height = 60 / 128) +
+    facet_wrap(~variable, ncol = 1) +
+    scale_fill_gradientn(colours = blues, limits = c(0, 1), breaks = c(0, 1),
+                         labels = c("low", "high"), name = "Power\n(within\neach panel)") +
+    scale_x_datetime(date_labels = "%H:%M", expand = c(0, 0)) +
+    scale_y_continuous(expand = c(0, 0)) +
+    labs(title = "Spectrograms: variation by timescale, over time",
+         subtitle = "Frequency in cycles per hour (2 cycles/hour = a 30-minute period). Each panel has its own color scale.",
+         x = "Time (UTC, center of each 128-minute window)", y = "Frequency (cycles/hour)") +
+    theme_swx() + theme(legend.position = "right", legend.title = element_text(colour = ink2))
+} else {
+  cat("Not enough continuous data yet for a spectrogram (needs > 2.5 hours).")
+}
+```
+
+## 4. A first look at predictability
+
+Before building any forecasting model, two simple questions: **how strongly does a value depend on the recent past** (autocorrelation), and **how good is the laziest possible forecast**, "the wind will stay exactly as it is now" (the *persistence* forecast)? Any model we build has to beat that baseline to be worth using.
+
+```{r}
+#| label: acf
+#| fig-width: 10
+#| fig-height: 4.2
+#| fig-alt: "Two bar charts of autocorrelation for lags up to 120 minutes: solar wind speed, which stays high, and its minute-to-minute change, which drops to near zero."
+x <- series[["Speed"]]$x
+acf_of <- function(v, label) {
+  a <- acf(v, lag.max = 120, plot = FALSE)
+  tibble(lag = as.numeric(a$lag[-1]), acf = as.numeric(a$acf[-1]), series = label, ci = 1.96 / sqrt(length(v)))
+}
+acf_df <- bind_rows(acf_of(x, "Speed"), acf_of(diff(x), "Speed, minute-to-minute change"))
+ggplot(acf_df, aes(lag, acf)) +
+  geom_hline(yintercept = 0, colour = axis_col, linewidth = 0.4) +
+  geom_hline(aes(yintercept = ci), colour = muted, linewidth = 0.3) +
+  geom_hline(aes(yintercept = -ci), colour = muted, linewidth = 0.3) +
+  geom_col(fill = one_color, width = 0.7) +
+  facet_wrap(~series) +
+  labs(title = "Autocorrelation of solar wind speed",
+       subtitle = "Gray lines: approximate 95% band for pure noise. Bars outside it are real dependence on the past.",
+       x = "Lag (minutes)", y = "Autocorrelation") +
+  theme_swx()
+```
+
+Left: speed stays strongly correlated with its own past for hours, which is why "same as now" is hard to beat. Right: the *change* from one minute to the next. If its first bar is clearly negative, part of the minute-to-minute jitter is measurement noise that reverts on the next reading, not real movement of the wind. That noise limits how precisely any model can be scored at 1-minute resolution.
+
+```{r}
+#| label: persistence
+#| fig-width: 10
+#| fig-height: 3.8
+#| fig-alt: "Line chart of the error of a persistence forecast of solar wind speed, rising with forecast horizon from 1 to 60 minutes."
+horizons <- 1:60
+rmse <- sapply(horizons, \(h) sqrt(mean((x[(h + 1):length(x)] - x[1:(length(x) - h)])^2)))
+pers <- tibble(horizon = horizons, rmse = rmse)
+mean_speed <- mean(x)
+ggplot(pers, aes(horizon, rmse)) +
+  geom_line(colour = one_color, linewidth = 0.6) +
+  annotate("text", x = 30, y = rmse[30], vjust = -1, colour = ink2, size = 3.3,
+           label = sprintf("30 min: %.1f km/s", rmse[30])) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(title = "Error of the persistence forecast (\"same as now\")",
+       subtitle = "RMSE of predicting speed h minutes ahead with the current value",
+       x = "Forecast horizon (minutes)", y = "RMSE (km/s)") + theme_swx()
+
+pers |> filter(horizon %in% c(1, 5, 15, 30, 60)) |>
+  transmute(`Horizon (min)` = horizon, `RMSE (km/s)` = round(rmse, 2),
+            `As % of mean speed` = sprintf("%.1f%%", 100 * rmse / mean_speed)) |>
+  kable(caption = "Persistence forecast error (table view of the chart above)")
+```
+
+Because wind speed changes slowly, "same as now" is a strong baseline: at 30 minutes it is off by about `r sprintf("%.1f", rmse[30])` km/s (`r sprintf("%.1f%%", 100 * rmse[30] / mean_speed)` of the mean speed in this window). **A forecasting model is only useful if it beats this number**, and most of the interesting gain will be during disturbed periods, which this window may not contain.
+
+## Limitations of this first look
+
+- **One window, probably a quiet one.** Conclusions about calm conditions do not transfer to storms, which are rare and dominate the impact.
+- **Real-time data is preliminary.** NOAA processes it for operations, not final science. Sources changed in mid-2026 (SOLAR-1 replaced DSCOVR as primary), so long series will mix instruments.
+- **Spectral estimates from a few hours of data are rough.** The fitted slopes are indicative, not measurements to quote.
+- **These charts are static images.** The numbers behind each are in the tables next to them.
+
+*Generated `r format(Sys.time(), "%Y-%m-%d %H:%M", tz = "UTC")` UTC from `r basename(db_path)`.*

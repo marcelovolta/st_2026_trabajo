@@ -11,3 +11,9 @@ logs/
 *.sqlite-shm
 .env
 .DS_Store
+
+# Notebook output is generated: re-create it with `quarto render`
+notebooks/*.html
+notebooks/*_files/
+notebooks/.quarto/
+*.knit.md

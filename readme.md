@@ -46,6 +46,14 @@ Rscript check.R                # health report: row counts, freshness, recent ru
 
 Data is stored in `data/spacewx.sqlite` (not tracked by git). To run it automatically every 5 minutes on your Mac, or to deploy it to a VPS, follow **[COLLECTOR.md](COLLECTOR.md)**.
 
+To look at the data, render the exploration notebook (time-domain and frequency-domain views of the current day). It writes a self-contained `notebooks/space-weather-explore.html`. Use the Render button in RStudio, or Quarto's command line (RStudio bundles it):
+
+```sh
+cd notebooks && quarto render space-weather-explore.qmd
+```
+
+By default it reads `data/spacewx.sqlite`. To explore a copy of the database from the VPS, set `SPACEWX_DB_PATH` to its absolute path before rendering.
+
 ## Repository layout
 
 ```
@@ -53,6 +61,7 @@ collect.R            entry point: one collection cycle
 check.R              health report for the collected data
 R/                   config (feeds and settings), database, download logic, helpers
 deploy/              systemd service + timer (VPS) and launchd job (macOS)
+notebooks/           exploration notebook (Quarto): time and frequency domain views
 docs/                background on the science and the data
 COLLECTOR.md         how to run, deploy and monitor the collector
 renv.lock            pinned R package versions

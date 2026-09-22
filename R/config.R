@@ -78,7 +78,7 @@ load_config <- function() {
     user_agent      = Sys.getenv("SPACEWX_USER_AGENT",
                                  "spacewx-collector (university class project)"),
     timeout_s       = 30,  # give up on a single HTTP request after 30 s
-    max_tries       = 3,   # attempts per feed before the run reports a failure
+    max_tries       = 3,   # download+parse attempts per feed before reporting a failure
     feeds           = FEEDS
   )
 }
