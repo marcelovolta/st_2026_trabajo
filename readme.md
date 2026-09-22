@@ -44,7 +44,7 @@ Rscript collect.R              # one collection cycle; the first run loads ~24 h
 Rscript check.R                # health report: row counts, freshness, recent runs, gaps
 ```
 
-Data is stored in `data/spacewx.sqlite` (not tracked by git). To run it automatically every 5 minutes on your Mac, or to deploy it to a VPS, follow **[COLLECTOR.md](COLLECTOR.md)**.
+Data is stored in `data/spacewx.sqlite` (not tracked by git). To run it automatically every 5 minutes on your Mac, or to deploy it to a VPS, follow **[COLLECTOR.md](COLLECTOR.md)**. For the record of the actual VPS deployment (commands, configs, what was verified), see **[docs/vps-deployment.md](docs/vps-deployment.md)**.
 
 To look at the data, render the exploration notebook (time-domain and frequency-domain views of the current day). It writes a self-contained `notebooks/space-weather-explore.html`. Use the Render button in RStudio, or Quarto's command line (RStudio bundles it):
 
@@ -69,7 +69,7 @@ renv.lock            pinned R package versions
 
 ## Status
 
-- Collector: implemented and tested on macOS against the live NOAA feeds. Not yet deployed on a VPS.
+- Collector: implemented, tested on macOS, and **deployed to a VPS** on 2026-09-22 (systemd timer, firewall, daily backups, uptime alert — see [docs/vps-deployment.md](docs/vps-deployment.md)).
 - Analysis and forecasting: not started.
 
 ## Data source and license
