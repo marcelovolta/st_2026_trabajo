@@ -47,7 +47,7 @@ The Mac must not sleep: System Settings → Energy → "Prevent automatic sleepi
 
 ## Deploy to a VPS (Ubuntu/Debian)
 
-> These steps have **not** been run on a real VPS yet (the scaffold was tested on macOS only). Expect to adjust small things, and treat the first deployment as a test.
+> Deployed and verified on a DigitalOcean droplet (Ubuntu 24.04, R 4.4.3) on 2026-09-22. The steps below are what was actually run.
 
 **1. Server.** Any small Linux VPS (1 vCPU / 1 GB RAM is plenty). Log in over SSH.
 
@@ -97,6 +97,34 @@ systemctl list-timers spacewx-collector.timer        # shows the next run
 ```sh
 cd /opt/spacewx-collector && sudo -u spacewx env SPACEWX_DB_PATH=/var/lib/spacewx/spacewx.sqlite Rscript check.R
 ```
+
+**9. Firewall.** A fresh droplet accepts any connection by default. Allow only SSH in:
+```sh
+ufw allow OpenSSH
+ufw --force enable
+ufw status
+```
+Always allow SSH *before* enabling, or you lock yourself out.
+
+**10. Daily backups.** `deploy/backup.sh` takes a consistent snapshot (safe while the collector writes), gzips it, and prunes anything older than 14 days. Install it to run once a day as the `spacewx` user:
+```sh
+chmod +x /opt/spacewx-collector/deploy/backup.sh
+cat <<'EOF' > /etc/cron.d/spacewx-backup
+0 3 * * * spacewx /opt/spacewx-collector/deploy/backup.sh >> /var/log/spacewx-backup.log 2>&1
+EOF
+touch /var/log/spacewx-backup.log && chown spacewx:spacewx /var/log/spacewx-backup.log
+sudo -u spacewx /opt/spacewx-collector/deploy/backup.sh   # test it once by hand
+```
+Backups land in `/var/lib/spacewx/backups/`. This protects against corruption or a mistake on the server, **not** against losing the server itself — periodically copy the folder off-box (e.g. `scp` it to your Mac).
+
+**11. Uptime alert.** Create a free check at [healthchecks.io](https://healthchecks.io) (no account needed to try it, but sign up to manage it later) named e.g. "spacewx collector", with a period of 10 minutes and a grace time of 5 minutes. Copy its ping URL (`https://hc-ping.com/<uuid>`) into the settings file:
+```sh
+cat <<'EOF' >> /etc/spacewx-collector.env
+SPACEWX_HEALTHCHECK_URL=https://hc-ping.com/<uuid>
+EOF
+systemctl start spacewx-collector.service   # trigger one run so it pings right away
+```
+If the collector stops pinging for the grace period, healthchecks.io emails you.
 
 ## What happens when something fails
 
