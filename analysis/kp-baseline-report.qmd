@@ -1,0 +1,206 @@
+---
+title: "Kp-only storm likelihood: baseline results"
+subtitle: "Persistence, ETS and ARIMA, backtested against climatology"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+    fig-format: png
+    fig-dpi: 144
+execute:
+  warning: false
+  message: false
+---
+
+## What this is
+
+Three candidate models for forecasting the Kp index from **its own history alone** — no solar wind, no Bz, nothing from the collector except a few recent weeks of live continuation. See `ANALYSIS.md` for why this is the deliberate starting point, and the project discussion for why a Kp-only model can do well on an *ongoing* storm's evolution but structurally cannot see a storm coming before Kp itself starts moving.
+
+Run `fit_baseline.R` before rendering this (it produces `data/baseline_results.rds`, read below).
+
+```{r}
+#| label: setup
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(knitr)
+
+if (!file.exists("R/config.R")) stop("Render this from the analysis/ folder.")
+for (f in list.files("R", pattern = "\\.R$", full.names = TRUE)) source(f)
+
+if (!file.exists("data/baseline_results.rds")) stop("Run fit_baseline.R first.")
+res <- readRDS("data/baseline_results.rds")
+ts <- res$ts; split <- res$split; fit <- res$fit; fit_live <- res$fit_live; scored <- res$scored; cfg <- res$cfg
+
+# Reference palette (see the collector's exploration notebook for the same
+# choices): fixed hue per entity, status colors reserved for storm/no-storm.
+ink <- "#0b0b0b"; ink2 <- "#52514e"; muted <- "#898781"
+grid_col <- "#e1e0d9"; axis_col <- "#c3c2b7"; surface <- "#fcfcfb"
+model_colors <- c(naive = "#898781", ets = "#eb6834", arima = "#2a78d6")
+status_good <- "#0ca30c"; status_critical <- "#d03b3b"
+
+theme_swx <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.background = element_rect(fill = surface, colour = NA),
+      panel.background = element_rect(fill = surface, colour = NA),
+      panel.grid.major = element_line(colour = grid_col, linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      axis.line.x = element_line(colour = axis_col, linewidth = 0.4),
+      axis.text = element_text(colour = muted),
+      axis.title = element_text(colour = ink2),
+      plot.title = element_text(colour = ink, face = "bold", size = 13),
+      plot.subtitle = element_text(colour = ink2),
+      plot.title.position = "plot",
+      strip.text = element_text(colour = ink, face = "bold", hjust = 0),
+      legend.position = "top", legend.text = element_text(colour = ink2), legend.title = element_blank()
+    )
+}
+fmt <- function(t) format(t, "%Y-%m-%d %H:%M", tz = "UTC")
+```
+
+## 1. The data
+
+```{r}
+#| label: overview
+cat(sprintf("Series: %s to %s, %d points (3-hour cadence).\n", fmt(min(ts$time)), fmt(max(ts$time)), nrow(ts)))
+cat(sprintf("Training period: up to %s (%d points).\n", fmt(split$cutoff), nrow(split$train)))
+cat(sprintf("Test period (backtest): after that, %d points.\n", sum(split$full$time > split$cutoff)))
+cat(sprintf("Storm threshold: Kp >= %d. Forecast horizon: %d steps (%d hours).\n",
+           cfg$storm_threshold, cfg$horizon_steps, cfg$horizon_steps * 3))
+```
+
+```{r}
+#| label: recent-series
+#| fig-width: 10
+#| fig-height: 3.6
+#| fig-alt: "Line chart of Kp over the most recent 90 days, with a horizontal reference line at the storm threshold Kp=5."
+recent <- ts |> filter(time >= max(time) - days(90))
+ggplot(recent, aes(time, kp)) +
+  geom_hline(yintercept = cfg$storm_threshold, colour = status_critical, linewidth = 0.4, linetype = 1) +
+  annotate("text", x = min(recent$time), y = cfg$storm_threshold, hjust = 0, vjust = -0.6,
+           label = sprintf("Kp %d = storm (G%d+)", cfg$storm_threshold, 1), colour = status_critical, size = 3.3) +
+  geom_line(colour = model_colors["arima"], linewidth = 0.4, na.rm = TRUE) +
+  scale_y_continuous(limits = c(0, 9), breaks = seq(0, 9, 3)) +
+  labs(title = "Kp, most recent 90 days", x = "Date (UTC)", y = "Kp") +
+  theme_swx()
+```
+
+## 2. Model fit (training period)
+
+```{r}
+#| label: glance
+fabletools::glance(fit) |>
+  select(.model, any_of(c("sigma2", "log_lik", "AIC", "AICc", "BIC", "MAE"))) |>
+  kable(digits = 3, caption = "Fit statistics on the training period. NAIVE has no likelihood (not a surprise -- it isn't an estimated model).")
+```
+
+## 3. RMSE skill: the continuous forecast
+
+```{r}
+#| label: rmse-skill
+rmse_tbl <- rmse_skill(scored)
+rmse_tbl |>
+  transmute(Model = .model, RMSE = round(rmse, 3), `Skill vs. naive` = sprintf("%+.1f%%", 100 * skill_vs_naive)) |>
+  kable(caption = "RMSE skill score: positive means better than persistence, negative means worse.")
+```
+
+```{r}
+#| label: rmse-by-horizon
+#| fig-width: 9
+#| fig-height: 4
+#| fig-alt: "Line chart of RMSE by forecast horizon step, one line per model, naive/ets/arima."
+by_h <- scored |>
+  filter(!is.na(kp_actual)) |>
+  mutate(h = as.integer(round(difftime(time, origin, units = "hours") / 3))) |>
+  group_by(.model, h) |>
+  summarise(rmse = sqrt(mean((kp_pred - kp_actual)^2)), .groups = "drop")
+ggplot(by_h, aes(h * 3, rmse, colour = .model)) +
+  geom_line(linewidth = 0.6) +
+  scale_colour_manual(values = model_colors) +
+  labs(title = "RMSE by forecast horizon", x = "Hours ahead", y = "RMSE (Kp units)") +
+  theme_swx()
+```
+
+## 4. Storm likelihood: Brier skill
+
+The number that actually answers the project's question: how much does each model's **P(storm)** forecast beat climatology (the plain base rate of storms in the training period)?
+
+```{r}
+#| label: brier-skill
+brier_tbl <- brier_skill(scored, split$train, cfg$storm_threshold)
+brier_tbl |>
+  transmute(Model = .model, Brier = round(brier, 4), `Brier (climatology)` = round(brier_climatology, 4),
+           `Storm periods in test` = n_storm_periods, `Total periods` = n_periods,
+           `Skill vs. climatology` = sprintf("%+.1f%%", 100 * brier_skill_score)) |>
+  kable(caption = "Brier skill score: positive means the model adds real information beyond the storm's base rate.")
+```
+
+```{r}
+#| label: brier-interpretation
+#| results: asis
+best_rmse <- rmse_tbl |> filter(.model != "naive") |> slice_max(skill_vs_naive, n = 1) |> pull(.model)
+best_brier <- brier_tbl |> slice_max(brier_skill_score, n = 1) |> pull(.model)
+if (best_brier == "naive" && best_rmse != "naive") {
+  cat(sprintf(
+    "**Worth noting:** %s has the best point-forecast accuracy (RMSE), but **naive persistence has the best storm-probability calibration (Brier skill)** in this backtest. These are genuinely different questions -- a model can be a better predictor of *the value* of Kp while being a worse predictor of *the probability of crossing a threshold*, for example by being overconfident (too narrow a predictive distribution). With only %d storm instances in this backtest, this result could also just be small-sample noise -- it's reported honestly rather than smoothed over, and is worth re-checking with a wider backtest.\n\n",
+    toupper(best_rmse), unique(brier_tbl$n_storm_periods)
+  ))
+}
+```
+
+With only `r brier_tbl$n_storm_periods[1]` storm instances sampled across `r brier_tbl$n_periods[1]` (origin, horizon) points (a direct consequence of coarse origin stepping — see `ANALYSIS.md` on `backtest_step` — not a bug), this diagram has too little data to say much beyond "predicted probabilities stayed low, as they should given how rare storms are in this sample." Widening `backtest_years`/tightening `backtest_step` (and accepting the slower run) is what would make it genuinely informative.
+
+```{r}
+#| label: reliability
+#| fig-width: 9
+#| fig-height: 4
+#| fig-alt: "Reliability diagram: predicted storm probability (binned) on the x axis against observed storm frequency on the y axis, one line per model, with a diagonal reference line for perfect calibration."
+reliability <- scored |>
+  filter(!is.na(kp_actual)) |>
+  mutate(actual = if_else(kp_actual >= cfg$storm_threshold, 1, 0),
+        bin = cut(p_storm, breaks = seq(0, 1, 0.1), include.lowest = TRUE)) |>
+  group_by(.model, bin) |>
+  summarise(pred = mean(p_storm), obs = mean(actual), n = n(), .groups = "drop") |>
+  filter(n >= 5)  # only show bins with enough points to mean something
+
+ggplot(reliability, aes(pred, obs, colour = .model)) +
+  geom_abline(slope = 1, intercept = 0, colour = axis_col, linewidth = 0.4) +
+  geom_line(linewidth = 0.5) +
+  geom_point(size = 1.8) +
+  scale_colour_manual(values = model_colors) +
+  scale_x_continuous(limits = c(0, 1), labels = scales::percent) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(title = "Reliability: predicted vs. observed storm frequency",
+       subtitle = "Gray diagonal = perfectly calibrated. Below it = overconfident; above it = underconfident.",
+       x = "Predicted P(storm)", y = "Observed frequency") +
+  theme_swx()
+```
+
+## 5. A live forecast, right now
+
+What the best-performing model (by Brier skill, from the backtest above) forecasts from `fit_live` -- a model fit on everything available up to the most recent point, which is NOT the same model `fit` used for backtesting above (that one is deliberately held back at the test cutoff, so it has never seen the test period; see `fit_baseline.R`).
+
+```{r}
+#| label: live-forecast
+best_model <- brier_tbl |> slice_max(brier_skill_score, n = 1) |> pull(.model)
+live_fc <- forecast_kp(fit_live, cfg$horizon_steps) |> storm_probability(cfg$storm_threshold) |>
+  tibble::as_tibble() |> filter(.model == best_model) |> select(time, kp_pred = .mean, p_storm)
+
+kable(live_fc |> mutate(kp_pred = round(kp_pred, 2), `P(storm)` = sprintf("%.1f%%", 100 * p_storm)) |>
+       select(`Time (UTC)` = time, `Forecast Kp` = kp_pred, `P(storm)`),
+     caption = sprintf("%s forecast from the latest available data (%s UTC).", toupper(best_model), fmt(max(ts$time))))
+```
+
+## Limitations
+
+- **Onset blindness.** As discussed in the project write-up: this model cannot anticipate a storm's *trigger*, only extrapolate what Kp is already doing. Good at persistence and decay, structurally unable to give early warning of a new event.
+- **A Gaussian predictive distribution** is what `fable` returns by default for these models; Kp is bounded at 0–9, so the storm-probability tail can be a rough approximation, especially at longer horizons.
+- **Backtest coverage.** The test period and its storm count are shown above (`n_storm_periods`) — if that number is small, the Brier skill estimate has real sampling uncertainty, which a short caption doesn't convey. Widen `backtest_years` in `R/config.R` for a more stable estimate, at the cost of a slower run.
+- **No solar wind, no seasonal term.** Both are deliberately deferred — see `ANALYSIS.md` and `R/model.R` for how they'd be added without restructuring this baseline.
+
+*Generated `r format(Sys.time(), "%Y-%m-%d %H:%M", tz = "UTC")` UTC.*

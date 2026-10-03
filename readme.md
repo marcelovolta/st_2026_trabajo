@@ -27,10 +27,7 @@ NOAA publishes only the last ~24 hours of the minute-level feeds, so a long time
 The work is split into two independent projects that share only the database schema:
 
 1. **Collector** (this repository, working): downloads the feeds every 5 minutes and stores them in SQLite. It is designed to run unattended on a small server, survive outages and restarts, and never store duplicates.
-2. **Analysis and forecasting** (separate project, not started): reads the collected data to
-   - forecast solar wind speed a few minutes ahead, evaluated against a naive "same as now" baseline;
-   - forecast the Kp index using wind speed and Bz measured at L1 as predictors;
-   - publish forecasts as they are made and score them afterwards, so results are honestly out-of-sample.
+2. **Analysis** (`analysis/`, baseline working): forecasts geomagnetic storm *likelihood* from the Kp index's own history alone -- deliberately simpler than forecasting solar wind first and translating it into Kp, since there is no deterministic formula between the two. Solar wind/Bz as predictors, and a 27-day solar-rotation seasonal term, are planned extensions that slot into the same model without restructuring it. See [analysis/ANALYSIS.md](analysis/ANALYSIS.md).
 
 Data will also be shared with others, most likely as periodic Parquet or CSV snapshots.
 
@@ -54,6 +51,15 @@ cd notebooks && quarto render space-weather-explore.qmd
 
 By default it reads `data/spacewx.sqlite`. To explore a copy of the database from the VPS, set `SPACEWX_DB_PATH` to its absolute path before rendering.
 
+**The analysis project** (`analysis/`) has its own, independent `renv` -- see [analysis/ANALYSIS.md](analysis/ANALYSIS.md) for how to run it. In short:
+
+```sh
+cd analysis && Rscript -e 'renv::restore()'
+Rscript fetch_historical_kp.R   # caches decades of Kp history from GFZ Potsdam
+Rscript fit_baseline.R          # fits + backtests persistence/ETS/ARIMA (a few minutes)
+quarto render kp-baseline-report.qmd
+```
+
 ## Repository layout
 
 ```
@@ -65,12 +71,13 @@ notebooks/           exploration notebook (Quarto): time and frequency domain vi
 docs/                background on the science and the data
 COLLECTOR.md         how to run, deploy and monitor the collector
 renv.lock            pinned R package versions
+analysis/            Kp-only storm-likelihood baseline (own renv) -- see analysis/ANALYSIS.md
 ```
 
 ## Status
 
 - Collector: implemented, tested on macOS, and **deployed to a VPS** on 2026-09-22 (systemd timer, firewall, daily backups, uptime alert — see [docs/vps-deployment.md](docs/vps-deployment.md)).
-- Analysis and forecasting: not started.
+- Analysis: Kp-only baseline (persistence/ETS/ARIMA, backtested with RMSE and Brier skill scores) implemented and validated against real data. Solar wind/Bz predictors and the 27-day seasonal term are planned next.
 
 ## Data source and license
 

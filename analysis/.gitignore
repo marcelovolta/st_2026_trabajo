@@ -1,0 +1,14 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+
+# Cached GFZ history, backtest results: regenerate with the entry scripts
+data/
+
+# Rendered notebook output: regenerate with `quarto render`
+*.html
+*_files/
+.quarto/
+*.knit.md
